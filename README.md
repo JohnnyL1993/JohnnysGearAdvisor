@@ -31,6 +31,7 @@ Download the latest release zip, delete the old `JohnnysGearAdvisor` folder, and
 - [Johnny's Warmane Addon Hub](https://github.com/JohnnyL1993/JohnnysAddonHub)
 - [Johnny's Blacklist](https://github.com/JohnnyL1993/JohnnysBlackList)
 - [Johnny's Currency Tracker](https://github.com/JohnnyL1993/JohnnysCurrencyBar)
+- [Johnny's Professions](https://github.com/JohnnyL1993/JohnnysProfessions)
 - [Johnny's Messenger](https://github.com/JohnnyL1993/JohnnysMessenger)
 - [Johnny's Raid Browser](https://github.com/JohnnyL1993/JohnnysRaidBrowser)
 - [Johnny's Raid Roll](https://github.com/JohnnyL1993/JohnnysRaidRoll)
