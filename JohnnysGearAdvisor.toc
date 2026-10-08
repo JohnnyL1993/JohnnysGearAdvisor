@@ -2,7 +2,7 @@
 ## Title: Johnny's Gear Advisor
 ## Notes: Shows upgrade candidates for your equipped gear based on your class/spec and current hit/expertise standing.
 ## Author: Johnny
-## Version: 1.0
+## Version: 1.1
 ## SavedVariables: JohnnysGearAdvisorDB
 
 Libs\LibStub\LibStub.lua
@@ -14,6 +14,7 @@ Libs\AceDB-3.0\AceDB-3.0.xml
 
 Core.lua
 Modules\Skin.lua
+Modules\VersionCheck.lua
 Modules\WindowSettings.lua
 
 Modules\GearUpgrade\SpecDetect.lua

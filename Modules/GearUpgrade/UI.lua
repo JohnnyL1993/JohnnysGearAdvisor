@@ -459,6 +459,8 @@ local function BuildFrame()
 	close:SetPoint("TOPRIGHT", -4, -4)
 	close:SetScript("OnClick", function() UI:Toggle() end)
 
+	JohnnysGearAdvisor.VersionCheck:AttachNotice(mainFrame)
+
 	if JohnnysGearAdvisor.WindowSettings then
 		JohnnysGearAdvisor.WindowSettings:AttachButton(mainFrame)
 	end
