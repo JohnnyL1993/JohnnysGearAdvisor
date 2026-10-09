@@ -2,7 +2,7 @@
 ## Title: Johnny's Gear Advisor
 ## Notes: Shows upgrade candidates for your equipped gear based on your class/spec and current hit/expertise standing.
 ## Author: Johnny
-## Version: 1.1
+## Version: 1.2
 ## SavedVariables: JohnnysGearAdvisorDB
 
 Libs\LibStub\LibStub.lua

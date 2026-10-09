@@ -1,13 +1,41 @@
--- Plain CreateFrame-based UI (no AceGUI). AceGUI's widget/layout system was
--- causing the panel to hang the whole client on open, so the panel here is built
--- directly from stock Blizzard frame templates instead (same approach the
--- bundled GearPlanner addon uses successfully on this client).
+-- Gear Advisor window, in the suite's "workshop rack" look.
+--
+-- Upgrades tab: every gear slot is listed on the left with what's equipped
+-- and its best available upgrade, biggest gain first - so "what should I get
+-- next?" is answered without clicking through 17 slots. Selecting a slot
+-- lists all its candidates on the right, filterable by where they come from.
+-- Tracking tab: the items you've chosen to go after, their emblem cost
+-- against what you hold, and which ones you now own.
+--
+-- Plain CreateFrame-based UI (no AceGUI - its widget/layout system was
+-- causing the panel to hang the whole client on open).
 JohnnysGearAdvisor.UI = {}
 local UI = JohnnysGearAdvisor.UI
+local Skin = JohnnysGearAdvisor.Skin
 local SpecDetect = JohnnysGearAdvisor.SpecDetect
 local StatWeights = JohnnysGearAdvisor.StatWeights
 local Scoring = JohnnysGearAdvisor.Scoring
 local Scanner = JohnnysGearAdvisor.Scanner
+local C = Skin.C
+
+local FRAME_WIDTH, FRAME_HEIGHT = 880, 580
+local PAD = 14
+local CONTENT_TOP = 96
+local CONTENT_WIDTH = FRAME_WIDTH - PAD * 2
+local SLOT_LIST_WIDTH = 350
+local SLOT_ROW_HEIGHT = 26
+local RIGHT_X = SLOT_LIST_WIDTH + 16
+-- Scrollbars render just outside a scrollframe's own width.
+local CAND_WIDTH = CONTENT_WIDTH - RIGHT_X - 24
+local TRACK_WIDTH = CONTENT_WIDTH - 24
+local ITEM_ROW_HEIGHT = 46
+-- A score difference this small is a wash, not an upgrade.
+local UPGRADE_EPSILON = 0.5
+-- Slots are scored one at a time on a short timer rather than all in one
+-- frame: scoring reads every candidate's tooltip, and the first pass also
+-- asks the server for any item the client hasn't seen yet.
+local SCAN_INTERVAL = 0.12
+local RETRY_SECONDS = 1.5
 
 local SLOT_LABELS = {
 	HeadSlot = "Head", NeckSlot = "Neck", ShoulderSlot = "Shoulder", BackSlot = "Back",
@@ -15,6 +43,13 @@ local SLOT_LABELS = {
 	LegsSlot = "Legs", FeetSlot = "Feet", Finger0Slot = "Ring 1", Finger1Slot = "Ring 2",
 	Trinket0Slot = "Trinket 1", Trinket1Slot = "Trinket 2", MainHandSlot = "Main Hand",
 	SecondaryHandSlot = "Off Hand", RangedSlot = "Ranged",
+}
+
+-- The two ring and two trinket slots draw on the same candidates, so an item
+-- already worn in one must not be offered as an upgrade for the other.
+local SIBLING_SLOT = {
+	Finger0Slot = "Finger1Slot", Finger1Slot = "Finger0Slot",
+	Trinket0Slot = "Trinket1Slot", Trinket1Slot = "Trinket0Slot",
 }
 
 -- Tracking-list filter categories. The two ring/trinket physical slots are
@@ -34,34 +69,117 @@ local function FilterCategoryForSlot(slotName)
 	return SLOT_LABELS[slotName] or slotName
 end
 
-local mainFrame, capLabel, candidatesHeading, candidatesScroll, candidatesContent, totalsLabel, trackingScroll, trackingContent
+-- Where a candidate comes from, for the source filters. Emblem purchases are
+-- the entries with a `cost` (see ItemDB.lua); raid and dungeon drops carry
+-- their size in the source text; crafted items, tokens and reputation rewards
+-- fall under "other".
+local SOURCE_FILTERS = {
+	{ key = "emblem", label = "Emblems", width = 66 },
+	{ key = "r10", label = "10-Man", width = 58 },
+	{ key = "r25", label = "25-Man", width = 58 },
+	{ key = "other", label = "Other", width = 52 },
+}
+
+local function SourceKind(cand)
+	if cand.cost then
+		return "emblem"
+	end
+	local source = cand.source or ""
+	if string.find(source, "25-Man", 1, true) then
+		return "r25"
+	elseif string.find(source, "10-Man", 1, true) then
+		return "r10"
+	end
+	return "other"
+end
+
+-- Emblems are currencies on this client; GetItemCount on the emblem's item id
+-- reports the amount held, with the currency list as a fallback by name.
+local CURRENCY_ITEMS = { Frost = 49426, Triumph = 47241, Conquest = 45624, Valor = 40753, Heroism = 40752 }
+local EXTRA_ITEMS = { ["1 Trophy of the Crusade"] = 47242 }
+
+local function HeldCurrency(currency)
+	local id = CURRENCY_ITEMS[currency]
+	local held = (id and GetItemCount(id)) or 0
+	if held == 0 and GetCurrencyListSize then
+		local want = "Emblem of " .. currency
+		for i = 1, GetCurrencyListSize() do
+			local name, isHeader, _, _, _, count = GetCurrencyListInfo(i)
+			if not isHeader and name == want then
+				return count or 0
+			end
+		end
+	end
+	return held
+end
+
+local function IsOwned(itemId)
+	return ((GetItemCount(itemId, true) or 0) > 0) or (IsEquippedItem(itemId) and true or false)
+end
+
+local mainFrame, crumbText, capText, capBar, scanText
 local suppressionRow, suppressionValueText
-local slotButtons = {}
+local upgradesTab, trackingTab
+local candHeading, candEquipped, candEmpty, candidatesScroll, candidatesContent
+local totalsLabel, trackingScroll, trackingContent, trackingEmpty
+local slotRows = {}
 local candidateRows = {}
 local trackingRows = {}
 local filterButtons = {}
 local specTabButtons = {}
+local sourceButtons = {}
+local upgradesOnlyBtn
+local sortButtons = {}
+local mainTabs = {}
+local activeMainTab = "Upgrades"
+
 local selectedSlot
-local trackingFilter -- nil/false = show all
+local slotSort = "gain" -- or "slot"
+local trackingFilter -- nil = show all
 local previewSpecKey -- nil = follow the character's actual active talent spec
 
--- 3.3.5a has no "item info received" event, so uncached items (names/icons still
--- showing as placeholders) are retried with a one-shot delayed refresh instead.
-local retryTicker = CreateFrame("Frame")
-retryTicker:Hide()
-local retryElapsed = 0
-retryTicker:SetScript("OnUpdate", function(self, elapsed)
-	retryElapsed = retryElapsed + elapsed
-	if retryElapsed >= 1 then
-		retryElapsed = 0
-		self:Hide()
-		UI:RefreshOpenCandidates()
-	end
-end)
+-- [slotName] = result of ScoreSlot, filled in by the scan queue.
+local slotResults = {}
+local scanQueue = {}
+local scanElapsed, retryElapsed = 0, 0
+local trackingDirty = false
 
-local function ScheduleRefresh()
-	retryElapsed = 0
-	retryTicker:Show()
+local function Filters()
+	local profile = JohnnysGearAdvisor.db.profile
+	if not profile.filters then
+		profile.filters = { upgradesOnly = true, emblem = true, r10 = true, r25 = true, other = true }
+	end
+	return profile.filters
+end
+
+local function Body(parent, color)
+	local fs = parent:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	fs:SetJustifyH("LEFT")
+	color = color or C.text
+	fs:SetTextColor(color[1], color[2], color[3])
+	return fs
+end
+
+-- A Skin button that stays lit (lime border, lighter fill) while selected.
+local function PaintToggle(btn, on)
+	if on then
+		btn:SetBackdropColor(0.122, 0.153, 0.169, 0.95)
+		btn:SetBackdropBorderColor(C.accent[1], C.accent[2], C.accent[3], 1)
+		btn.text:SetTextColor(C.text[1], C.text[2], C.text[3])
+	else
+		btn:SetBackdropColor(C.panel[1], C.panel[2], C.panel[3], 0.95)
+		btn:SetBackdropBorderColor(C.rule2[1], C.rule2[2], C.rule2[3], 1)
+		local dimmed = btn.dimmed and C.dim or C.muted
+		btn.text:SetTextColor(dimmed[1], dimmed[2], dimmed[3])
+	end
+end
+
+-- StyleButton's own OnMouseUp repaints the idle fill, so toggles re-apply
+-- their look from there as well.
+local function MakeToggle(btn, isOn)
+	btn.isOn = isOn
+	btn:SetScript("OnMouseUp", function(self) PaintToggle(self, self.isOn()) end)
+	PaintToggle(btn, isOn())
 end
 
 -- Returns (classFile, specKey, specName, role) - normally your actual active
@@ -80,26 +198,37 @@ local function GetSpec()
 	return classFile, activeKey, activeName, activeRole
 end
 
-local function FormatDelta(delta)
-	if delta > 0.5 then
-		return "|cff40ff40+" .. string.format("%.1f", delta) .. "|r"
-	elseif delta < -0.5 then
-		return "|cffff4040" .. string.format("%.1f", delta) .. "|r"
+-- Gain shown as "how much better than what you're wearing" - the raw score
+-- difference means nothing on its own. An empty slot has nothing to be a
+-- percentage of, so it falls back to the raw figure.
+local function GainText(cand, equippedScore)
+	local delta = cand.delta
+	if equippedScore and equippedScore > 0 then
+		local pct = delta / equippedScore * 100
+		if delta > UPGRADE_EPSILON then
+			return string.format("|cffb9e24a+%.1f%%|r", pct)
+		elseif delta < -UPGRADE_EPSILON then
+			return string.format("|cffff7366%.1f%%|r", pct)
+		end
+		return "|cff9aa8a6same|r"
 	end
-	return "|cffaaaaaa~" .. string.format("%.1f", delta) .. "|r"
+	if delta > UPGRADE_EPSILON then
+		return string.format("|cffb9e24a+%.0f|r", delta)
+	end
+	return "|cff9aa8a6same|r"
 end
 
 -- Only vendor/token-purchased items carry a `cost` (see ItemDB.lua); boss drops
 -- and reputation rewards have none, so there's nothing to display for those.
-local function FormatCost(cost)
+local function CostText(cost)
 	if not cost then
-		return ""
+		return nil
 	end
-	local text = string.format("%d %s Emblem%s", cost.amount, cost.currency, cost.amount == 1 and "" or "s")
+	local text = string.format("%d Emblem%s of %s", cost.amount, cost.amount == 1 and "" or "s", cost.currency)
 	if cost.extra then
 		text = text .. " + " .. cost.extra
 	end
-	return "\n|cffffd200" .. text .. "|r"
+	return text
 end
 
 local function TrackingList()
@@ -115,19 +244,85 @@ local function IsTracked(itemId, slotName)
 	return false
 end
 
-function UI:AddToTracking(itemId, slotName, source, cost)
-	if IsTracked(itemId, slotName) then
-		return
+----------------------------------------------------------------------------
+-- Scoring a slot, and the queue that works through all of them
+----------------------------------------------------------------------------
+local function ScoreSlot(slotName)
+	local _, specKey = GetSpec()
+	local result = { candidates = {}, pending = 0 }
+	if not specKey then
+		result.noDatabase = true
+		return result
 	end
-	table.insert(TrackingList(), { itemId = itemId, slot = slotName, source = source, cost = cost })
-	self:RefreshTracking()
+
+	local equippedScore, candidates, pendingCount = Scoring:GetUpgradesForSlot(slotName, specKey)
+	if not equippedScore then
+		result.noDatabase = true
+		return result
+	end
+	result.equippedScore = equippedScore
+	result.pending = pendingCount or 0
+
+	local equippedId = GetInventoryItemID("player", GetInventorySlotInfo(slotName))
+	local sibling = SIBLING_SLOT[slotName]
+	local siblingId = sibling and GetInventoryItemID("player", GetInventorySlotInfo(sibling))
+
+	-- Already sorted best-first by Scoring.
+	for _, cand in ipairs(candidates) do
+		if cand.itemId ~= equippedId and cand.itemId ~= siblingId then
+			cand.kind = SourceKind(cand)
+			table.insert(result.candidates, cand)
+		end
+	end
+	return result
 end
 
-function UI:RemoveFromTracking(index)
-	table.remove(TrackingList(), index)
-	self:RefreshTracking()
+local function PassesSource(cand)
+	return Filters()[cand.kind] ~= false
 end
 
+-- The best candidate for a slot under the current source filters, or nil if
+-- nothing there beats what's equipped.
+local function BestUpgrade(result)
+	if not result or result.noDatabase then
+		return nil
+	end
+	for _, cand in ipairs(result.candidates) do
+		if PassesSource(cand) then
+			if cand.delta > UPGRADE_EPSILON then
+				return cand
+			end
+			return nil
+		end
+	end
+	return nil
+end
+
+local function QueueSlot(slotName)
+	for _, queued in ipairs(scanQueue) do
+		if queued == slotName then
+			return
+		end
+	end
+	table.insert(scanQueue, slotName)
+end
+
+local function QueueAllSlots(reset)
+	if reset then
+		slotResults = {}
+	end
+	-- The selected slot first, so its candidate list fills in immediately.
+	if selectedSlot then
+		QueueSlot(selectedSlot)
+	end
+	for _, slotName in ipairs(Scanner.SLOT_NAMES) do
+		QueueSlot(slotName)
+	end
+end
+
+----------------------------------------------------------------------------
+-- Header: spec and hit cap
+----------------------------------------------------------------------------
 -- Demonology/Destruction can't read Suppression's rank live off the Affliction
 -- tab the way Affliction itself does (see StatWeights.lua's "manual" reduction
 -- source), so this shows a stepper for the player to set it themselves. Hidden
@@ -141,16 +336,20 @@ local function RefreshSuppressionRow(specKey)
 	suppressionValueText:SetText(tostring(JohnnysGearAdvisor.db.profile.suppressionPoints or 0))
 end
 
--- Hidden entirely (blank text) for healer-role specs, since heals can't miss.
+-- Hit against the cap as a short line and a meter. Hidden for healer-role
+-- specs, since heals can't miss.
 local function RefreshCapLabel()
 	local classFile, specKey, specName, role = GetSpec()
+	capBar:Hide()
 	if not specKey then
-		capLabel:SetText("Unrecognized class/spec.")
+		crumbText:SetText("")
+		capText:SetText("Unrecognised class or spec.")
 		suppressionRow:Hide()
 		return
 	end
+	crumbText:SetText(string.upper(specName) .. "  /  " .. string.upper(tostring(role)))
 	if not StatWeights:GetForSpec(specKey) then
-		capLabel:SetText(specName .. " (" .. role .. "): no item database yet for this spec.")
+		capText:SetText("No item database yet for this spec.")
 		suppressionRow:Hide()
 		return
 	end
@@ -159,52 +358,103 @@ local function RefreshCapLabel()
 
 	local capInfo = StatWeights:GetHitCapInfo(specKey)
 	if not capInfo then
-		capLabel:SetText(specName .. " (" .. role .. ") - hit cap not applicable.")
+		capText:SetText("Hit cap doesn't apply to this spec.")
 		return
 	end
 
 	local current = StatWeights:GetCurrentHitPercent(capInfo.ratingType)
 	local remaining = capInfo.capPercent - current
-	local status
+	local status, color
 	if remaining < -0.05 then
-		status = "|cffff4040" .. string.format("%.1f%% OVER cap", -remaining) .. "|r"
+		status, color = string.format("%.1f%% over cap", -remaining), C.short
 	elseif remaining < 0.05 then
-		status = "|cff40ff40at cap|r"
+		status, color = "at cap", C.accent
 	else
-		status = "|cffffff40" .. string.format("%.1f%% below cap", remaining) .. "|r"
+		status, color = string.format("%.1f%% below cap", remaining), { 1, 0.85, 0.40 }
 	end
-	capLabel:SetText(string.format("%s - Hit: %.1f%% / %.1f%% cap (%s)", specName, current, capInfo.capPercent, status))
+	capText:SetText(string.format("HIT  %.1f%% / %.1f%%   |cff%02x%02x%02x%s|r", current, capInfo.capPercent,
+		color[1] * 255, color[2] * 255, color[3] * 255, status))
+
+	local fraction = (capInfo.capPercent > 0) and math.min(1, math.max(0, current / capInfo.capPercent)) or 0
+	if fraction <= 0 then
+		capBar.fill:Hide()
+	else
+		capBar.fill:Show()
+		capBar.fill:SetWidth(math.max(1, (capBar:GetWidth() - 2) * fraction))
+		capBar.fill:SetVertexColor(color[1], color[2], color[3], 1)
+	end
+	capBar:Show()
 end
 
-local function CreateItemRow(parent, withCheckbox)
+----------------------------------------------------------------------------
+-- Upgrades tab
+----------------------------------------------------------------------------
+local RefreshSlotList, RefreshCandidates
+
+local function CreateSlotRow(parent, index)
 	local row = CreateFrame("Button", nil, parent)
-	row:SetSize(560, 46)
-	row:EnableMouse(true)
+	row:SetSize(SLOT_LIST_WIDTH, SLOT_ROW_HEIGHT)
+	row:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -26 - (index - 1) * SLOT_ROW_HEIGHT)
+
+	row.bg = row:CreateTexture(nil, "BACKGROUND")
+	row.bg:SetAllPoints()
+	row.bg:SetTexture(Skin.WHITE)
+	row.bg:SetVertexColor(0.122, 0.153, 0.169, 1)
+	row.bg:Hide()
+
+	local highlight = row:CreateTexture(nil, "HIGHLIGHT")
+	highlight:SetAllPoints()
+	highlight:SetTexture(Skin.WHITE)
+	highlight:SetVertexColor(1, 1, 1, 0.06)
+
+	row.bar = Skin:Solid(row, "ARTWORK", C.accent)
+	row.bar:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+	row.bar:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 0, 0)
+	row.bar:SetWidth(2)
+	row.bar:Hide()
+
+	local rule = Skin:Solid(row, "BORDER", C.rule)
+	rule:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 0, 0)
+	rule:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 0, 0)
+	rule:SetHeight(1)
 
 	row.icon = row:CreateTexture(nil, "ARTWORK")
-	row.icon:SetSize(28, 28)
-	row.icon:SetPoint("LEFT", 2, 0)
+	row.icon:SetSize(20, 20)
+	row.icon:SetPoint("LEFT", row, "LEFT", 8, 0)
+	row.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
-	row.text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-	row.text:SetPoint("LEFT", row.icon, "RIGHT", 8, 0)
-	row.text:SetJustifyH("LEFT")
-	row.text:SetWidth(withCheckbox and 380 or 460)
+	row.slot = Body(row, C.muted)
+	row.slot:SetPoint("LEFT", row, "LEFT", 34, 0)
+	row.slot:SetWidth(66)
 
-	if withCheckbox then
-		row.check = CreateFrame("CheckButton", nil, row, "UICheckButtonTemplate")
-		row.check:SetSize(24, 24)
-		row.check:SetPoint("RIGHT", -4, 0)
-	else
-		row.remove = JohnnysGearAdvisor.Skin:CreateButton(row, 70, 22, "Remove")
-		row.remove:SetPoint("RIGHT", -4, 0)
+	row.gain = Body(row, C.text)
+	row.gain:SetPoint("RIGHT", row, "RIGHT", -8, 0)
+	row.gain:SetJustifyH("RIGHT")
+	row.gain:SetWidth(54)
+
+	row.best = Body(row, C.text)
+	row.best:SetPoint("LEFT", row, "LEFT", 102, 0)
+	row.best:SetWidth(SLOT_LIST_WIDTH - 102 - 66)
+	row.best:SetHeight(11)
+	if row.best.SetWordWrap then
+		row.best:SetWordWrap(false)
 	end
 
+	row:SetScript("OnClick", function(self)
+		if self.slotName then
+			UI:ShowCandidatesForSlot(self.slotName)
+		end
+	end)
 	row:SetScript("OnEnter", function(self)
-		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-		if self.itemLink then
-			GameTooltip:SetHyperlink(self.itemLink)
+		if not self.slotName then
+			return
+		end
+		local link = GetInventoryItemLink("player", GetInventorySlotInfo(self.slotName))
+		GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+		if link then
+			GameTooltip:SetHyperlink(link)
 		else
-			GameTooltip:SetText("Loading item...")
+			GameTooltip:SetText(SLOT_LABELS[self.slotName] .. " (empty)")
 		end
 		GameTooltip:Show()
 	end)
@@ -213,94 +463,358 @@ local function CreateItemRow(parent, withCheckbox)
 	return row
 end
 
-local function LayoutRows(rows, parent, yStart, rowHeight)
-	for i, row in ipairs(rows) do
-		row:ClearAllPoints()
-		row:SetPoint("TOPLEFT", parent, "TOPLEFT", 4, yStart - (i - 1) * rowHeight)
+RefreshSlotList = function()
+	if not upgradesTab then
+		return
+	end
+
+	local order = {}
+	for i, slotName in ipairs(Scanner.SLOT_NAMES) do
+		local result = slotResults[slotName]
+		local best = BestUpgrade(result)
+		table.insert(order, { slotName = slotName, index = i, result = result, best = best })
+	end
+	if slotSort == "gain" then
+		table.sort(order, function(a, b)
+			local ad = a.best and a.best.delta or -1
+			local bd = b.best and b.best.delta or -1
+			if ad ~= bd then
+				return ad > bd
+			end
+			return a.index < b.index
+		end)
+	end
+
+	for i, entry in ipairs(order) do
+		local row = slotRows[i]
+		if not row then
+			row = CreateSlotRow(upgradesTab, i)
+			slotRows[i] = row
+		end
+		row.slotName = entry.slotName
+		row.slot:SetText(SLOT_LABELS[entry.slotName])
+
+		local texture = GetInventoryItemTexture("player", GetInventorySlotInfo(entry.slotName))
+		row.icon:SetTexture(texture or "Interface\\PaperDollInfoFrame\\UI-GearManager-LeaveItem-Slot")
+
+		local result = entry.result
+		if not result then
+			row.best:SetText("Checking...")
+			row.best:SetTextColor(C.dim[1], C.dim[2], C.dim[3])
+			row.gain:SetText("")
+		elseif result.noDatabase then
+			row.best:SetText("No item database for this spec")
+			row.best:SetTextColor(C.dim[1], C.dim[2], C.dim[3])
+			row.gain:SetText("")
+		elseif entry.best then
+			local name = GetItemInfo(entry.best.itemId)
+			row.best:SetText(name or ("Item #" .. entry.best.itemId))
+			row.best:SetTextColor(C.text[1], C.text[2], C.text[3])
+			row.gain:SetText(GainText(entry.best, result.equippedScore))
+		else
+			if result.pending > 0 and #result.candidates == 0 then
+				row.best:SetText("Loading items...")
+			else
+				row.best:SetText("Nothing better found")
+			end
+			row.best:SetTextColor(C.dim[1], C.dim[2], C.dim[3])
+			row.gain:SetText("")
+		end
+
+		if entry.slotName == selectedSlot then
+			row.bg:Show()
+			row.bar:Show()
+		else
+			row.bg:Hide()
+			row.bar:Hide()
+		end
+		row:Show()
+	end
+
+	for key, btn in pairs(sortButtons) do
+		PaintToggle(btn, key == slotSort)
+	end
+
+	if #scanQueue > 0 then
+		scanText:SetText(string.format("Checking slots... %d left", #scanQueue))
+	else
+		scanText:SetText("")
+	end
+end
+
+local function CreateItemRow(parent, width)
+	local row = CreateFrame("Button", nil, parent)
+	row:SetSize(width, ITEM_ROW_HEIGHT)
+	row:EnableMouse(true)
+
+	local highlight = row:CreateTexture(nil, "HIGHLIGHT")
+	highlight:SetAllPoints()
+	highlight:SetTexture(Skin.WHITE)
+	highlight:SetVertexColor(1, 1, 1, 0.05)
+
+	local rule = Skin:Solid(row, "BORDER", C.rule)
+	rule:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 0, 0)
+	rule:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 0, 0)
+	rule:SetHeight(1)
+
+	row.icon = row:CreateTexture(nil, "ARTWORK")
+	row.icon:SetSize(28, 28)
+	row.icon:SetPoint("LEFT", 4, 0)
+	row.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+
+	row.text = Body(row, C.text)
+	row.text:SetPoint("LEFT", row.icon, "RIGHT", 8, 0)
+	row.text:SetWidth(width - 44 - 150)
+
+	row.tag = Body(row, C.accent)
+	row.tag:SetPoint("RIGHT", row, "RIGHT", -84, 0)
+	row.tag:SetJustifyH("RIGHT")
+
+	row.action = Skin:CreateButton(row, 72, 22, "")
+	row.action:SetPoint("RIGHT", -4, 0)
+
+	row:SetScript("OnEnter", function(self)
+		GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+		if self.itemLink then
+			GameTooltip:SetHyperlink(self.itemLink)
+			if self.scoreNote then
+				GameTooltip:AddLine(self.scoreNote, 0.6, 0.66, 0.65)
+			end
+		else
+			GameTooltip:SetText("Loading item...")
+		end
+		GameTooltip:Show()
+	end)
+	row:SetScript("OnLeave", function() GameTooltip:Hide() end)
+	return row
+end
+
+local function LayoutRows(rows, parent, count)
+	for i = 1, count do
+		rows[i]:ClearAllPoints()
+		rows[i]:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -(i - 1) * ITEM_ROW_HEIGHT)
+	end
+	parent:SetHeight(math.max(20, count * ITEM_ROW_HEIGHT))
+end
+
+RefreshCandidates = function()
+	if not upgradesTab then
+		return
+	end
+	for _, row in ipairs(candidateRows) do
+		row:Hide()
+	end
+	candEmpty:Hide()
+
+	local filters = Filters()
+	PaintToggle(upgradesOnlyBtn, filters.upgradesOnly ~= false)
+	for key, btn in pairs(sourceButtons) do
+		PaintToggle(btn, filters[key] ~= false)
+	end
+
+	if not selectedSlot then
+		candHeading:SetText("PICK A SLOT")
+		candEquipped:SetText("Choose a slot on the left to see everything that could go in it.")
+		candidatesContent:SetHeight(20)
+		return
+	end
+
+	local label = SLOT_LABELS[selectedSlot] or selectedSlot
+	candHeading:SetText(string.upper(label))
+	local equippedLink = GetInventoryItemLink("player", GetInventorySlotInfo(selectedSlot))
+	candEquipped:SetText(equippedLink and ("Equipped: " .. equippedLink) or "Nothing equipped in this slot.")
+
+	local result = slotResults[selectedSlot]
+	local function Empty(text)
+		candEmpty:SetText(text)
+		candEmpty:Show()
+		candidatesContent:SetHeight(20)
+	end
+	if not result then
+		Empty("Checking this slot...")
+		return
+	end
+	if result.noDatabase then
+		Empty("There is no item database yet for this spec.")
+		return
+	end
+
+	local shown, hidden = 0, 0
+	for _, cand in ipairs(result.candidates) do
+		local passes = PassesSource(cand) and (filters.upgradesOnly == false or cand.delta > UPGRADE_EPSILON)
+		if not passes then
+			hidden = hidden + 1
+		else
+			shown = shown + 1
+			local name, link, _, _, _, _, _, _, _, icon = GetItemInfo(cand.itemId)
+			local row = candidateRows[shown]
+			if not row then
+				row = CreateItemRow(candidatesContent, CAND_WIDTH)
+				candidateRows[shown] = row
+			end
+			row.itemLink = link
+			row.scoreNote = string.format("Advisor score %+.1f against your equipped item", cand.delta)
+			row.icon:SetTexture(icon or "Interface\\Icons\\INV_Misc_QuestionMark")
+
+			local lines = { (name or ("Item #" .. cand.itemId)) .. "   " .. GainText(cand, result.equippedScore) }
+			table.insert(lines, "|cff9aa8a6" .. (cand.source or "") .. "|r")
+			local cost = CostText(cand.cost)
+			if cost then
+				table.insert(lines, "|cffe6ecea" .. cost .. "|r")
+			end
+			row.text:SetText(table.concat(lines, "\n"))
+			row.tag:SetText("")
+
+			local tracked = IsTracked(cand.itemId, selectedSlot)
+			row.action.text:SetText(tracked and "Tracked" or "Track")
+			PaintToggle(row.action, tracked)
+			local slotName = selectedSlot
+			row.action:SetScript("OnMouseUp", function(self) PaintToggle(self, IsTracked(cand.itemId, slotName)) end)
+			row.action:SetScript("OnClick", function()
+				if IsTracked(cand.itemId, slotName) then
+					for idx, entry in ipairs(TrackingList()) do
+						if entry.itemId == cand.itemId and entry.slot == slotName then
+							UI:RemoveFromTracking(idx)
+							break
+						end
+					end
+				else
+					UI:AddToTracking(cand.itemId, slotName, cand.source, cand.cost)
+				end
+				RefreshCandidates()
+			end)
+			row:Show()
+		end
+	end
+
+	LayoutRows(candidateRows, candidatesContent, shown)
+
+	if shown == 0 then
+		if result.pending > 0 and #result.candidates == 0 then
+			Empty("Loading item data from the server, one moment...")
+		elseif #result.candidates == 0 then
+			-- Weapon slots in particular can have no candidates at all for a
+			-- class nobody has curated weapons for yet.
+			Empty("The database has no other items for this slot and class.")
+		elseif filters.upgradesOnly ~= false then
+			Empty("Nothing here beats what you have equipped. Turn off \"Upgrades only\" to see all " .. hidden .. " items.")
+		else
+			Empty("All " .. hidden .. " items for this slot are hidden by the source filters above.")
+		end
 	end
 end
 
 function UI:ShowCandidatesForSlot(slotName)
 	selectedSlot = slotName
-	candidatesHeading:SetText("|cffffd200" .. (SLOT_LABELS[slotName] or slotName) .. " - candidates|r")
-
-	local classFile, specKey = GetSpec()
-	local equippedScore, allCandidates, pendingCount = Scoring:GetUpgradesForSlot(slotName, specKey)
-
-	for _, row in ipairs(candidateRows) do
-		row:Hide()
+	if not slotResults[slotName] then
+		-- Jump the queue so this slot's list fills in first.
+		table.insert(scanQueue, 1, slotName)
 	end
-
-	if not equippedScore then
-		candidatesHeading:SetText("|cffffd200" .. (SLOT_LABELS[slotName] or slotName) .. "|r - no item database yet for this spec.")
-		candidatesContent:SetHeight(20)
-		return
-	end
-
-	if pendingCount and pendingCount > 0 then
-		ScheduleRefresh()
-	end
-
-	-- Show every candidate in the database for this slot/class, upgrade or not -
-	-- deltas are only as good as the stat-weight model behind them, so a downgrade
-	-- or wash is left visible (in red/grey via FormatDelta) rather than hidden,
-	-- in case the score for a genuine upgrade is being computed wrong.
-	local candidates = allCandidates
-
-	if #candidates == 0 then
-		if pendingCount and pendingCount > 0 then
-			candidatesHeading:SetText("|cffffd200" .. (SLOT_LABELS[slotName] or slotName) .. "|r - no cached candidates yet, one moment...")
-		else
-			-- Weapon slots in particular can have zero candidates at all for a
-			-- class we haven't curated weapons for.
-			candidatesHeading:SetText("|cffffd200" .. (SLOT_LABELS[slotName] or slotName) .. "|r - no candidates in the database yet for this slot/class.")
-		end
-		candidatesContent:SetHeight(20)
-		return
-	end
-
-	for i, cand in ipairs(candidates) do
-		local name, link, _, _, _, _, _, _, _, icon = GetItemInfo(cand.itemId)
-		if not name then
-			ScheduleRefresh()
-		end
-
-		local row = candidateRows[i]
-		if not row then
-			row = CreateItemRow(candidatesContent, true)
-			candidateRows[i] = row
-		end
-
-		row.itemLink = link
-		row.icon:SetTexture(icon or "Interface\\Icons\\INV_Misc_QuestionMark")
-		row.text:SetText(string.format("%s  %s\n|cff888888%s|r%s", name or ("Item #" .. cand.itemId), FormatDelta(cand.delta), cand.source, FormatCost(cand.cost)))
-		row.check:SetChecked(IsTracked(cand.itemId, slotName))
-		row.check:SetScript("OnClick", function(self)
-			if self:GetChecked() then
-				UI:AddToTracking(cand.itemId, slotName, cand.source, cand.cost)
-			else
-				for idx, entry in ipairs(TrackingList()) do
-					if entry.itemId == cand.itemId and entry.slot == slotName then
-						UI:RemoveFromTracking(idx)
-						break
-					end
-				end
-			end
-		end)
-		row:Show()
-	end
-
-	LayoutRows(candidateRows, candidatesContent, -2, 48)
-	candidatesContent:SetHeight(math.max(20, #candidates * 48 + 4))
+	RefreshSlotList()
+	RefreshCandidates()
 end
 
--- Sums each tracked item's emblem cost by currency (Frost/Triumph), plus a count
--- of any non-numeric "extra" requirement (e.g. Trophy of the Crusade tokens).
--- Items with no `cost` (boss drops, reputation rewards) simply don't contribute.
+local function BuildUpgradesTab(parent)
+	upgradesTab = parent
+
+	local sortLabel = Skin:Heading(parent, 10, C.muted)
+	sortLabel:SetPoint("TOPLEFT", 0, -5)
+	sortLabel:SetText("ORDER")
+	local anchor = sortLabel
+	for i, def in ipairs({ { "gain", "Biggest gain" }, { "slot", "By slot" } }) do
+		local btn = Skin:CreateButton(parent, 86, 20, def[2])
+		btn:SetPoint("LEFT", anchor, "RIGHT", (i == 1) and 8 or 2, 0)
+		btn:SetScript("OnClick", function()
+			slotSort = def[1]
+			RefreshSlotList()
+		end)
+		btn:SetScript("OnMouseUp", function(self) PaintToggle(self, slotSort == def[1]) end)
+		sortButtons[def[1]] = btn
+		anchor = btn
+	end
+
+	scanText = Body(parent, C.dim)
+	scanText:SetPoint("LEFT", anchor, "RIGHT", 10, 0)
+
+	-- Right column: the selected slot's candidates.
+	candHeading = Skin:Heading(parent, 13, C.text)
+	candHeading:SetPoint("TOPLEFT", RIGHT_X, -3)
+
+	candEquipped = Body(parent, C.muted)
+	candEquipped:SetPoint("LEFT", candHeading, "RIGHT", 10, 0)
+	candEquipped:SetWidth(CAND_WIDTH - 110)
+	candEquipped:SetHeight(11)
+	if candEquipped.SetWordWrap then
+		candEquipped:SetWordWrap(false)
+	end
+
+	local filters = Filters()
+	upgradesOnlyBtn = Skin:CreateButton(parent, 98, 20, "Upgrades only")
+	upgradesOnlyBtn:SetPoint("TOPLEFT", RIGHT_X, -24)
+	upgradesOnlyBtn:SetScript("OnClick", function()
+		filters.upgradesOnly = not (filters.upgradesOnly ~= false)
+		RefreshCandidates()
+	end)
+	MakeToggle(upgradesOnlyBtn, function() return filters.upgradesOnly ~= false end)
+
+	local sourceLabel = Skin:Heading(parent, 10, C.muted)
+	sourceLabel:SetPoint("LEFT", upgradesOnlyBtn, "RIGHT", 14, 0)
+	sourceLabel:SetText("FROM")
+	local prev = sourceLabel
+	for i, def in ipairs(SOURCE_FILTERS) do
+		local btn = Skin:CreateButton(parent, def.width, 20, def.label)
+		btn:SetPoint("LEFT", prev, "RIGHT", (i == 1) and 8 or 2, 0)
+		btn:SetScript("OnClick", function()
+			filters[def.key] = not (filters[def.key] ~= false)
+			-- Source filters change which item is "best" for every slot.
+			RefreshSlotList()
+			RefreshCandidates()
+		end)
+		MakeToggle(btn, function() return filters[def.key] ~= false end)
+		sourceButtons[def.key] = btn
+		prev = btn
+	end
+
+	candidatesScroll = CreateFrame("ScrollFrame", "GearAdvisorCandidatesScroll", parent, "UIPanelScrollFrameTemplate")
+	candidatesScroll:SetPoint("TOPLEFT", RIGHT_X, -50)
+	candidatesScroll:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", RIGHT_X, 0)
+	candidatesScroll:SetWidth(CAND_WIDTH)
+	candidatesContent = CreateFrame("Frame", nil, candidatesScroll)
+	candidatesContent:SetSize(CAND_WIDTH, 20)
+	candidatesScroll:SetScrollChild(candidatesContent)
+
+	candEmpty = Body(parent, C.muted)
+	candEmpty:SetPoint("TOPLEFT", candidatesScroll, "TOPLEFT", 6, -10)
+	candEmpty:SetWidth(CAND_WIDTH - 12)
+	candEmpty:Hide()
+end
+
+----------------------------------------------------------------------------
+-- Tracking tab
+----------------------------------------------------------------------------
+function UI:AddToTracking(itemId, slotName, source, cost)
+	if IsTracked(itemId, slotName) then
+		return
+	end
+	table.insert(TrackingList(), { itemId = itemId, slot = slotName, source = source, cost = cost })
+	self:RefreshTracking()
+end
+
+function UI:RemoveFromTracking(index)
+	table.remove(TrackingList(), index)
+	self:RefreshTracking()
+end
+
+-- Emblem cost of the tracked items you don't own yet, per currency, against
+-- what you currently hold. Items with no `cost` (boss drops, reputation
+-- rewards) simply don't contribute.
 local function BuildTotalsText(list)
 	local totals, extras, hasAny = {}, {}, false
+	local owned = 0
 	for _, entry in ipairs(list) do
-		if entry.cost then
+		if IsOwned(entry.itemId) then
+			owned = owned + 1
+		elseif entry.cost then
 			hasAny = true
 			totals[entry.cost.currency] = (totals[entry.cost.currency] or 0) + entry.cost.amount
 			if entry.cost.extra then
@@ -309,19 +823,37 @@ local function BuildTotalsText(list)
 		end
 	end
 
-	if not hasAny then
-		return "No emblem cost among tracked items yet."
-	end
-
 	local parts = {}
 	for currency, amount in pairs(totals) do
-		table.insert(parts, string.format("%d %s Emblems", amount, currency))
+		local held = HeldCurrency(currency)
+		local color = (held >= amount) and "b9e24a" or "ff7366"
+		table.insert(parts, string.format("Emblem of %s: %d needed, |cff%s%d held|r", currency, amount, color, held))
 	end
 	for extra, count in pairs(extras) do
-		table.insert(parts, string.format("%dx %s", count, extra))
+		local itemId = EXTRA_ITEMS[extra]
+		local label = string.gsub(extra, "^%d+%s*", "")
+		if itemId then
+			local held = GetItemCount(itemId, true) or 0
+			local color = (held >= count) and "b9e24a" or "ff7366"
+			table.insert(parts, string.format("%s: %d needed, |cff%s%d held|r", label, count, color, held))
+		else
+			table.insert(parts, string.format("%s: %d needed", label, count))
+		end
 	end
 	table.sort(parts)
-	return "|cffffd200Total cost: " .. table.concat(parts, "  +  ") .. "|r"
+
+	local text
+	if #list == 0 then
+		text = "Nothing tracked yet. On the Upgrades tab, press Track on any item you plan to go after."
+	elseif not hasAny then
+		text = "None of the tracked items you still need has an emblem cost."
+	else
+		text = table.concat(parts, "\n")
+	end
+	if owned > 0 then
+		text = text .. string.format("\n|cffb9e24a%d tracked item%s already owned|r - not counted above.", owned, owned == 1 and "" or "s")
+	end
+	return text
 end
 
 -- Rows show the tracking list filtered to `trackingFilter` (a FILTER_CATEGORIES
@@ -329,84 +861,141 @@ end
 -- entry's real position in the full (unfiltered) tracking list, so Remove still
 -- deletes the right item regardless of what's currently filtered out of view.
 function UI:RefreshTracking()
+	if not trackingTab then
+		return
+	end
 	local list = TrackingList()
 	totalsLabel:SetText(BuildTotalsText(list))
+	if mainTabs.Tracking then
+		mainTabs.Tracking.button.text:SetText(string.format("02  TRACKING (%d)", #list))
+	end
 
 	for _, row in ipairs(trackingRows) do
 		row:Hide()
 	end
 
-	local shown = {}
+	local shown = 0
 	for i, entry in ipairs(list) do
 		if not trackingFilter or FilterCategoryForSlot(entry.slot) == trackingFilter then
 			local name, link, _, _, _, _, _, _, _, icon = GetItemInfo(entry.itemId)
 			if not name then
-				ScheduleRefresh()
+				trackingDirty = true
 			end
-
-			local row = trackingRows[#shown + 1]
+			shown = shown + 1
+			local row = trackingRows[shown]
 			if not row then
-				row = CreateItemRow(trackingContent, false)
-				row.remove:SetScript("OnClick", function()
+				row = CreateItemRow(trackingContent, TRACK_WIDTH)
+				row.action.text:SetText("Remove")
+				row.action:SetScript("OnClick", function()
 					UI:RemoveFromTracking(row.trackIndex)
+					RefreshCandidates()
 				end)
-				trackingRows[#shown + 1] = row
+				trackingRows[shown] = row
 			end
-
 			row.trackIndex = i
 			row.itemLink = link
+			row.scoreNote = nil
 			row.icon:SetTexture(icon or "Interface\\Icons\\INV_Misc_QuestionMark")
-			row.text:SetText(string.format("%s\n|cff888888%s - %s|r%s", name or ("Item #" .. entry.itemId), SLOT_LABELS[entry.slot] or entry.slot, entry.source, FormatCost(entry.cost)))
+
+			local lines = { name or ("Item #" .. entry.itemId) }
+			table.insert(lines, "|cff9aa8a6" .. (SLOT_LABELS[entry.slot] or entry.slot) .. "  -  " .. (entry.source or "") .. "|r")
+			local cost = CostText(entry.cost)
+			if cost then
+				table.insert(lines, "|cffe6ecea" .. cost .. "|r")
+			end
+			row.text:SetText(table.concat(lines, "\n"))
+			row.tag:SetText(IsOwned(entry.itemId) and "OWNED" or "")
 			row:Show()
-			table.insert(shown, row)
 		end
 	end
 
-	if #shown == 0 then
-		trackingContent:SetHeight(20)
-		return
+	LayoutRows(trackingRows, trackingContent, shown)
+
+	if shown == 0 and #list > 0 then
+		trackingEmpty:SetText("No tracked items in this slot. Choose All to see the whole list.")
+		trackingEmpty:Show()
+	else
+		trackingEmpty:Hide()
 	end
 
-	LayoutRows(shown, trackingContent, -2, 48)
-	trackingContent:SetHeight(#shown * 48 + 4)
+	for cat, btn in pairs(filterButtons) do
+		PaintToggle(btn, cat == (trackingFilter or "All"))
+	end
 end
 
 function UI:SetTrackingFilter(category)
 	trackingFilter = category
-	for cat, btn in pairs(filterButtons) do
-		if cat == (category or "All") then
-			btn:LockHighlight()
-		else
-			btn:UnlockHighlight()
-		end
-	end
 	self:RefreshTracking()
+end
+
+local function BuildTrackingTab(parent)
+	trackingTab = parent
+
+	totalsLabel = Body(parent, C.text)
+	totalsLabel:SetPoint("TOPLEFT", 0, -2)
+	totalsLabel:SetWidth(CONTENT_WIDTH)
+	totalsLabel:SetJustifyV("TOP")
+	totalsLabel:SetHeight(58)
+
+	-- Filter buttons: "All" plus one per slot category, to narrow the tracking
+	-- list down (e.g. just Head, just Rings) without losing the rest.
+	local filterNames = { "All" }
+	for _, cat in ipairs(FILTER_CATEGORIES) do
+		table.insert(filterNames, cat)
+	end
+	for i, name in ipairs(filterNames) do
+		local btn = Skin:CreateButton(parent, 50, 20, name)
+		btn:SetWidth(math.max(40, btn.text:GetStringWidth() + 16))
+		filterButtons[name] = btn
+	end
+	local x = 0
+	for _, name in ipairs(filterNames) do
+		local btn = filterButtons[name]
+		btn:SetPoint("TOPLEFT", x, -64)
+		x = x + btn:GetWidth() + 2
+		btn:SetScript("OnClick", function() UI:SetTrackingFilter(name ~= "All" and name or nil) end)
+		btn:SetScript("OnMouseUp", function(self) PaintToggle(self, name == (trackingFilter or "All")) end)
+	end
+
+	trackingScroll = CreateFrame("ScrollFrame", "GearAdvisorTrackingScroll", parent, "UIPanelScrollFrameTemplate")
+	trackingScroll:SetPoint("TOPLEFT", 0, -92)
+	trackingScroll:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", 0, 0)
+	trackingScroll:SetWidth(TRACK_WIDTH)
+	trackingContent = CreateFrame("Frame", nil, trackingScroll)
+	trackingContent:SetSize(TRACK_WIDTH, 20)
+	trackingScroll:SetScrollChild(trackingContent)
+
+	trackingEmpty = Body(parent, C.muted)
+	trackingEmpty:SetPoint("TOPLEFT", trackingScroll, "TOPLEFT", 6, -10)
+	trackingEmpty:SetWidth(TRACK_WIDTH - 12)
+	trackingEmpty:Hide()
+end
+
+----------------------------------------------------------------------------
+-- Spec preview
+----------------------------------------------------------------------------
+local function RefreshSpecTabs()
+	local _, activeKey = SpecDetect:GetActiveSpec()
+	local highlightKey = previewSpecKey or activeKey
+	for key, btn in pairs(specTabButtons) do
+		PaintToggle(btn, key == highlightKey)
+	end
 end
 
 function UI:SetPreviewSpec(specKey)
 	local classFile, activeKey = SpecDetect:GetActiveSpec()
 	previewSpecKey = (specKey == activeKey) and nil or specKey
-
-	local highlightKey = previewSpecKey or activeKey
-	for key, btn in pairs(specTabButtons) do
-		if key == highlightKey then
-			btn:LockHighlight()
-		else
-			btn:UnlockHighlight()
-		end
-	end
-
+	RefreshSpecTabs()
 	RefreshCapLabel()
-	if selectedSlot then
-		self:ShowCandidatesForSlot(selectedSlot)
-	end
+	QueueAllSlots(true)
+	RefreshSlotList()
+	RefreshCandidates()
 end
 
 function UI:RefreshOpenCandidates()
-	if mainFrame and mainFrame:IsShown() and selectedSlot then
-		self:ShowCandidatesForSlot(selectedSlot)
-	end
 	if mainFrame and mainFrame:IsShown() then
+		RefreshSlotList()
+		RefreshCandidates()
 		self:RefreshTracking()
 	end
 end
@@ -414,26 +1003,105 @@ end
 function UI:OnSpecChanged()
 	-- An actual in-game respec supersedes whatever spec tab was being previewed.
 	previewSpecKey = nil
-	local _, activeKey = SpecDetect:GetActiveSpec()
-	for key, btn in pairs(specTabButtons) do
-		if key == activeKey then
-			btn:LockHighlight()
+	if mainFrame and mainFrame:IsShown() then
+		RefreshSpecTabs()
+		RefreshCapLabel()
+		QueueAllSlots(true)
+		RefreshSlotList()
+		RefreshCandidates()
+	end
+end
+
+----------------------------------------------------------------------------
+-- Window shell
+----------------------------------------------------------------------------
+local function SelectMainTab(name)
+	activeMainTab = name
+	for tabName, tab in pairs(mainTabs) do
+		if tabName == name then
+			tab.frame:Show()
+			tab.button.text:SetTextColor(C.text[1], C.text[2], C.text[3])
+			tab.button.bar:Show()
 		else
-			btn:UnlockHighlight()
+			tab.frame:Hide()
+			tab.button.text:SetTextColor(C.muted[1], C.muted[2], C.muted[3])
+			tab.button.bar:Hide()
+		end
+	end
+	if name == "Tracking" then
+		UI:RefreshTracking()
+	else
+		RefreshSlotList()
+		RefreshCandidates()
+	end
+end
+
+-- A numbered text tab ("01  UPGRADES") with a lime underline when active.
+local function CreateMainTab(parent, index, name)
+	local btn = CreateFrame("Button", nil, parent)
+	btn:SetSize(130, 24)
+	btn.text = Skin:Heading(btn, 12, C.muted)
+	btn.text:SetPoint("LEFT", btn, "LEFT", 4, 0)
+	btn.text:SetText(string.format("%02d  %s", index, string.upper(name)))
+	btn.bar = Skin:Solid(btn, "ARTWORK", C.accent)
+	btn.bar:SetPoint("BOTTOMLEFT", btn, "BOTTOMLEFT", 0, 0)
+	btn.bar:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", 0, 0)
+	btn.bar:SetHeight(2)
+	btn.bar:Hide()
+	btn:SetScript("OnEnter", function(self)
+		self.text:SetTextColor(C.text[1], C.text[2], C.text[3])
+	end)
+	btn:SetScript("OnLeave", function(self)
+		if activeMainTab ~= name then
+			self.text:SetTextColor(C.muted[1], C.muted[2], C.muted[3])
+		end
+	end)
+	btn:SetScript("OnClick", function() SelectMainTab(name) end)
+	return btn
+end
+
+-- Works through the scan queue one slot at a time, re-queues slots whose
+-- items were still loading (3.3.5a has no "item info received" event), and
+-- repaints the tracking list when bags change.
+local function OnTick(self, elapsed)
+	scanElapsed = scanElapsed + elapsed
+	if scanElapsed >= SCAN_INTERVAL then
+		scanElapsed = 0
+		local slotName = table.remove(scanQueue, 1)
+		if slotName then
+			slotResults[slotName] = ScoreSlot(slotName)
+			if activeMainTab == "Upgrades" then
+				RefreshSlotList()
+				if slotName == selectedSlot then
+					RefreshCandidates()
+				end
+			end
 		end
 	end
 
-	if mainFrame and mainFrame:IsShown() then
-		RefreshCapLabel()
-		if selectedSlot then
-			self:ShowCandidatesForSlot(selectedSlot)
+	retryElapsed = retryElapsed + elapsed
+	if retryElapsed >= RETRY_SECONDS then
+		retryElapsed = 0
+		if #scanQueue == 0 then
+			for _, slotName in ipairs(Scanner.SLOT_NAMES) do
+				local result = slotResults[slotName]
+				if result and not result.noDatabase and result.pending > 0 then
+					QueueSlot(slotName)
+				end
+			end
+		end
+		if trackingDirty then
+			trackingDirty = false
+			if activeMainTab == "Tracking" then
+				UI:RefreshTracking()
+			end
 		end
 	end
 end
 
 local function BuildFrame()
 	mainFrame = CreateFrame("Frame", "GearAdvisorFrame", UIParent)
-	mainFrame:SetSize(620, 1000)
+	mainFrame:SetSize(FRAME_WIDTH, FRAME_HEIGHT)
 	mainFrame:SetPoint("RIGHT", UIParent, "RIGHT", -20, 0)
 	mainFrame:SetFrameStrata("DIALOG")
 	mainFrame:SetMovable(true)
@@ -441,7 +1109,7 @@ local function BuildFrame()
 	mainFrame:RegisterForDrag("LeftButton")
 	mainFrame:SetScript("OnDragStart", mainFrame.StartMoving)
 	mainFrame:SetScript("OnDragStop", mainFrame.StopMovingOrSizing)
-	JohnnysGearAdvisor.Skin:StylePanel(mainFrame, 0.92)
+	Skin:StylePanel(mainFrame, 0.95)
 	mainFrame:Hide()
 
 	-- Per-window scale/opacity (see Modules\WindowSettings.lua). Guarded so a
@@ -451,196 +1119,145 @@ local function BuildFrame()
 		JohnnysGearAdvisor.WindowSettings:Register(mainFrame, "main", "Gear Advisor")
 	end
 
-	local title = mainFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
-	title:SetPoint("TOP", 0, -16)
-	title:SetText("Gear Advisor - Gear Upgrade")
+	local title = Skin:AddHeader(mainFrame, "Gear Advisor")
+	crumbText = Skin:Heading(mainFrame, 12, C.muted)
+	crumbText:SetPoint("BOTTOMLEFT", title, "BOTTOMRIGHT", 10, 1)
 
-	local close = JohnnysGearAdvisor.Skin:CreateButton(mainFrame, 20, 20, "X")
+	local close = Skin:CreateButton(mainFrame, 20, 20, "X")
 	close:SetPoint("TOPRIGHT", -4, -4)
 	close:SetScript("OnClick", function() UI:Toggle() end)
 
-	JohnnysGearAdvisor.VersionCheck:AttachNotice(mainFrame)
+	-- The update notice anchors itself to its host's top-left corner, which
+	-- the title occupies, so give it a host left of the Cfg button.
+	local noticeHost = CreateFrame("Frame", nil, mainFrame)
+	noticeHost:SetSize(220, Skin.HEADER_HEIGHT)
+	noticeHost:SetPoint("TOPRIGHT", mainFrame, "TOPRIGHT", -76, 2)
+	JohnnysGearAdvisor.VersionCheck:AttachNotice(noticeHost)
 
 	if JohnnysGearAdvisor.WindowSettings then
 		JohnnysGearAdvisor.WindowSettings:AttachButton(mainFrame)
 	end
 
 	-- Spec-preview tabs: one per spec archetype the class has (e.g. all three for
-	-- Rogue, Affliction/Demonology/Destruction for Warlock), even if some don't
-	-- have a real item database yet - clicking one of those just shows "no item
-	-- database yet for this spec" rather than being unavailable. Lets you preview
-	-- another spec's recommendations without actually respeccing. Hit-cap numbers
-	-- still reflect your real, currently active talents/gear since we can't know
-	-- hypothetical talent choices for a spec you're not actually in.
+	-- Rogue), even if some don't have a real item database yet - those are
+	-- dimmed and just report "no item database". Lets you preview another
+	-- spec's recommendations without actually respeccing. Hit-cap numbers
+	-- still reflect your real, currently active talents/gear since we can't
+	-- know hypothetical talent choices for a spec you're not actually in.
 	local classFile = (SpecDetect:GetActiveSpec())
 	local archetypes = SpecDetect:GetArchetypesForClass(classFile)
 	if #archetypes > 1 then
-		local tabX = 20
+		local tabX = PAD
 		for _, archetype in ipairs(archetypes) do
-			local btn = JohnnysGearAdvisor.Skin:CreateButton(mainFrame, 100, 20, archetype.name)
-			btn:SetPoint("TOPLEFT", tabX, -38)
-			if not StatWeights:GetForSpec(archetype.key) then
-				btn.text:SetTextColor(0.5, 0.5, 0.5)
-			end
+			local btn = Skin:CreateButton(mainFrame, 100, 20, archetype.name)
+			btn:SetPoint("TOPLEFT", tabX, -36)
+			btn.dimmed = not StatWeights:GetForSpec(archetype.key)
 			btn:SetScript("OnClick", function() UI:SetPreviewSpec(archetype.key) end)
+			btn:SetScript("OnMouseUp", function(self)
+				local _, activeKey = SpecDetect:GetActiveSpec()
+				PaintToggle(self, archetype.key == (previewSpecKey or activeKey))
+			end)
 			specTabButtons[archetype.key] = btn
 			tabX = tabX + 102
 		end
-		local _, activeKey = SpecDetect:GetActiveSpec()
-		if specTabButtons[activeKey] then
-			specTabButtons[activeKey]:LockHighlight()
-		end
 	end
 
-	capLabel = mainFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	capLabel:SetPoint("TOP", 0, -62)
+	-- Hit against the cap: a meter on the right with the figures beside it.
+	capBar = CreateFrame("Frame", nil, mainFrame)
+	capBar:SetSize(150, 10)
+	capBar:SetPoint("TOPRIGHT", mainFrame, "TOPRIGHT", -PAD, -41)
+	Skin:StylePanel(capBar, 1)
+	capBar:SetBackdropColor(C.panel[1], C.panel[2], C.panel[3], 1)
+	capBar.fill = capBar:CreateTexture(nil, "ARTWORK")
+	capBar.fill:SetTexture(Skin.WHITE)
+	capBar.fill:SetPoint("TOPLEFT", 1, -1)
+	capBar.fill:SetPoint("BOTTOMLEFT", 1, 1)
+	capBar:Hide()
+
+	capText = Body(mainFrame, C.text)
+	capText:SetPoint("RIGHT", capBar, "LEFT", -10, 0)
+	capText:SetJustifyH("RIGHT")
 
 	-- Manual Suppression-points stepper for Demonology/Destruction (see
 	-- RefreshSuppressionRow); hidden for every other spec.
 	suppressionRow = CreateFrame("Frame", nil, mainFrame)
-	suppressionRow:SetSize(230, 20)
-	suppressionRow:SetPoint("TOP", 0, -84)
-
-	local suppressionLabel = suppressionRow:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	suppressionRow:SetSize(196, 20)
+	suppressionRow:SetPoint("TOPRIGHT", mainFrame, "TOPRIGHT", -PAD, -62)
+	local suppressionLabel = Body(suppressionRow, C.muted)
 	suppressionLabel:SetPoint("LEFT", 0, 0)
 	suppressionLabel:SetText("Suppression points:")
-
-	local suppressionMinus = JohnnysGearAdvisor.Skin:CreateButton(suppressionRow, 20, 20, "-")
+	local suppressionMinus = Skin:CreateButton(suppressionRow, 20, 20, "-")
 	suppressionMinus:SetPoint("LEFT", suppressionLabel, "RIGHT", 8, 0)
 	suppressionMinus:SetScript("OnClick", function()
 		local points = JohnnysGearAdvisor.db.profile.suppressionPoints or 0
 		JohnnysGearAdvisor.db.profile.suppressionPoints = math.max(0, points - 1)
 		RefreshCapLabel()
 	end)
-
-	suppressionValueText = suppressionRow:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	suppressionValueText = Body(suppressionRow, C.text)
 	suppressionValueText:SetPoint("LEFT", suppressionMinus, "RIGHT", 8, 0)
 	suppressionValueText:SetWidth(14)
 	suppressionValueText:SetJustifyH("CENTER")
-
-	local suppressionPlus = JohnnysGearAdvisor.Skin:CreateButton(suppressionRow, 20, 20, "+")
+	local suppressionPlus = Skin:CreateButton(suppressionRow, 20, 20, "+")
 	suppressionPlus:SetPoint("LEFT", suppressionValueText, "RIGHT", 8, 0)
 	suppressionPlus:SetScript("OnClick", function()
 		local points = JohnnysGearAdvisor.db.profile.suppressionPoints or 0
 		JohnnysGearAdvisor.db.profile.suppressionPoints = math.min(2, points + 1)
 		RefreshCapLabel()
 	end)
+	suppressionRow:Hide()
 
-	local slotsLabel = mainFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-	slotsLabel:SetPoint("TOPLEFT", 20, -106)
-	slotsLabel:SetTextColor(1, 1, 1)
-	slotsLabel:SetText("Equipped Gear (click a slot):")
+	-- Main tabs.
+	local tabRule = Skin:Solid(mainFrame, "ARTWORK", C.rule)
+	tabRule:SetPoint("TOPLEFT", mainFrame, "TOPLEFT", 1, -86)
+	tabRule:SetPoint("TOPRIGHT", mainFrame, "TOPRIGHT", -1, -86)
+	tabRule:SetHeight(1)
 
-	-- 6 columns (not 9) at an 80px pitch - labels like "Main Hand"/"Off Hand" are
-	-- wider than the 36px icon, so packing 9 columns into the frame's width left
-	-- no room between them and adjacent labels ran into each other. Row height
-	-- (58) leaves room for the icon (36) plus its label below with breathing
-	-- room on both sides.
-	local COLUMNS = 6
-	for i, slotName in ipairs(Scanner.SLOT_NAMES) do
-		local col = (i - 1) % COLUMNS
-		local row = math.floor((i - 1) / COLUMNS)
+	for index, name in ipairs({ "Upgrades", "Tracking" }) do
+		local btn = CreateMainTab(mainFrame, index, name)
+		btn:SetPoint("TOPLEFT", PAD + (index - 1) * 138, -62)
+		local tabFrame = CreateFrame("Frame", nil, mainFrame)
+		tabFrame:SetPoint("TOPLEFT", PAD, -CONTENT_TOP)
+		tabFrame:SetPoint("BOTTOMRIGHT", -PAD, PAD)
+		tabFrame:Hide()
+		mainTabs[name] = { button = btn, frame = tabFrame }
+	end
+	BuildUpgradesTab(mainTabs.Upgrades.frame)
+	BuildTrackingTab(mainTabs.Tracking.frame)
 
-		local btn = CreateFrame("Button", nil, mainFrame)
-		btn:SetSize(36, 36)
-		btn:SetPoint("TOPLEFT", 20 + col * 80, -124 - row * 58)
+	mainFrame:SetScript("OnUpdate", OnTick)
 
-		btn.icon = btn:CreateTexture(nil, "ARTWORK")
-		btn.icon:SetAllPoints()
-		btn.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-
-		btn.label = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-		btn.label:SetPoint("TOP", btn, "BOTTOM", 0, -4)
-		btn.label:SetTextColor(1, 1, 1)
-		btn.label:SetText(SLOT_LABELS[slotName])
-
-		btn:SetScript("OnEnter", function(self)
-			local slotId = GetInventorySlotInfo(slotName)
-			local link = GetInventoryItemLink("player", slotId)
-			GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-			if link then
-				GameTooltip:SetHyperlink(link)
-			else
-				GameTooltip:SetText(SLOT_LABELS[slotName] .. " (empty)")
+	-- Swapping gear changes every slot's baseline; bag changes can mean a
+	-- tracked item was just obtained or emblems were earned.
+	local watcher = CreateFrame("Frame", nil, mainFrame)
+	watcher:RegisterEvent("UNIT_INVENTORY_CHANGED")
+	watcher:RegisterEvent("BAG_UPDATE")
+	watcher:SetScript("OnEvent", function(self, event, unit)
+		if not mainFrame:IsShown() then
+			return
+		end
+		if event == "UNIT_INVENTORY_CHANGED" then
+			if unit == "player" then
+				RefreshCapLabel()
+				QueueAllSlots(false)
 			end
-			GameTooltip:Show()
-		end)
-		btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-		btn:SetScript("OnClick", function() UI:ShowCandidatesForSlot(slotName) end)
-
-		slotButtons[slotName] = btn
-	end
-
-	candidatesHeading = mainFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	candidatesHeading:SetPoint("TOPLEFT", 20, -296)
-	candidatesHeading:SetText("Click a gear slot above to see upgrade candidates.")
-
-	candidatesScroll = CreateFrame("ScrollFrame", "GearAdvisorCandidatesScroll", mainFrame, "UIPanelScrollFrameTemplate")
-	candidatesScroll:SetPoint("TOPLEFT", 20, -316)
-	candidatesScroll:SetSize(560, 220)
-
-	candidatesContent = CreateFrame("Frame", nil, candidatesScroll)
-	candidatesContent:SetSize(560, 20)
-	candidatesScroll:SetScrollChild(candidatesContent)
-
-	local trackingLabel = mainFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	trackingLabel:SetPoint("TOPLEFT", 20, -554)
-	trackingLabel:SetText("|cffffd200Tracking List|r")
-
-	totalsLabel = mainFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	totalsLabel:SetPoint("TOPLEFT", 20, -572)
-	totalsLabel:SetPoint("TOPRIGHT", -20, -572)
-	totalsLabel:SetJustifyH("LEFT")
-
-	-- Filter buttons: "All" plus one per slot category, to narrow the tracking
-	-- list down (e.g. just Head, just Rings) without losing the rest.
-	local FILTER_COLUMNS = 8
-	local filterNames = { "All" }
-	for _, cat in ipairs(FILTER_CATEGORIES) do
-		table.insert(filterNames, cat)
-	end
-	for i, name in ipairs(filterNames) do
-		local col = (i - 1) % FILTER_COLUMNS
-		local row = math.floor((i - 1) / FILTER_COLUMNS)
-		local btn = JohnnysGearAdvisor.Skin:CreateButton(mainFrame, 68, 20, name)
-		btn:SetPoint("TOPLEFT", 20 + col * 70, -592 - row * 22)
-		btn:SetScript("OnClick", function() UI:SetTrackingFilter(name == "All" and nil or name) end)
-		filterButtons[name] = btn
-	end
-	filterButtons["All"]:LockHighlight()
-
-	trackingScroll = CreateFrame("ScrollFrame", "GearAdvisorTrackingScroll", mainFrame, "UIPanelScrollFrameTemplate")
-	trackingScroll:SetPoint("TOPLEFT", 20, -636)
-	trackingScroll:SetPoint("BOTTOMRIGHT", -32, 20)
-
-	trackingContent = CreateFrame("Frame", nil, trackingScroll)
-	trackingContent:SetSize(560, 20)
-	trackingScroll:SetScrollChild(trackingContent)
-end
-
-local function RefreshSlotIcons()
-	for slotName, btn in pairs(slotButtons) do
-		local slotId = GetInventorySlotInfo(slotName)
-		local texture = GetInventoryItemTexture("player", slotId)
-		btn.icon:SetTexture(texture or "Interface\\PaperDollInfoFrame\\UI-GearManager-LeaveItem-Slot")
-	end
+		else
+			trackingDirty = true
+		end
+	end)
 end
 
 function UI:Toggle()
 	if not mainFrame then
 		BuildFrame()
 	end
-
 	if mainFrame:IsShown() then
 		mainFrame:Hide()
 		return
 	end
-
 	mainFrame:Show()
-	RefreshSlotIcons()
+	RefreshSpecTabs()
 	RefreshCapLabel()
+	QueueAllSlots(false)
 	self:RefreshTracking()
-	if selectedSlot then
-		self:ShowCandidatesForSlot(selectedSlot)
-	end
+	SelectMainTab(activeMainTab)
 end
