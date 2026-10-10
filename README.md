@@ -4,6 +4,10 @@ A World of Warcraft 3.3.5a addon for the Warmane private server.
 
 Shows upgrade candidates for your equipped gear based on your class/spec and current hit/expertise standing.
 
+## Screenshots
+
+![Gear Advisor](screenshots/gearadvisor.png)
+
 ## Requirements
 
 No other addons required. Johnny's Raid Comp uses it for spec detection and extra gear stats when both are installed.
