@@ -1,3 +1,6 @@
+# Work in progress 
+has plenty of bugs that im working through, if you want to put some in the issues tab to help me through it that will be great
+
 # Johnny's Gear Advisor
 
 A World of Warcraft 3.3.5a addon for the Warmane private server.
